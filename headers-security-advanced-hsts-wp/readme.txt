@@ -4,7 +4,7 @@ Donate link: https://www.buymeacoffee.com/tentacleplugins
 Tags: headers security, hsts, headers, clickjacking, csp
 Requires at least: 4.7
 Tested up to: 6.9
-Stable tag: 5.3.0
+Stable tag: 5.3.2
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -467,7 +467,7 @@ This will cause the <a href="https://developers.cloudflare.com/cache/how-to/purg
 
 == Changelog ==
 
-= 5.3.0 =
+= 5.3.2 =
 This update introduces **Shield** — optional advanced tools for professionals who need deeper security monitoring. Every existing feature remains completely free, forever.
 
 - New: Shield tab-based interface (Settings, Dashboard, CSP, Notifications, Export/Import, License, Free vs Shield, FAQ)
