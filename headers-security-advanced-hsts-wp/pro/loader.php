@@ -4,7 +4,7 @@
  *
  *
  * @package HeadersSecurityAdvancedHSTSWP
- * @since   5.3.2
+ * @since   5.3.3
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
