@@ -16,6 +16,26 @@ delete_option( 'hsts_x_frame_options_url_field' );
 delete_option( 'hsts_x_frame_options' );
 
 delete_option( 'hsts_csp_report_uri' );
+
+// Plugin state / migration bookkeeping.
+delete_option( 'hsts_plugin_db_version' );
+delete_option( 'hsts_show_migration_notice_v2' );
+delete_option( 'hsts_htaccess_cleanup_pending' );
+
+// Per-header suppression flags (5.3.4+ naming).
+delete_option( 'hsts_disable_strict_transport_security' );
+delete_option( 'hsts_disable_content_security_policy' );
+delete_option( 'hsts_disable_permissions_policy' );
+delete_option( 'hsts_disable_x_frame_options' );
+delete_option( 'hsts_disable_x_content_type_options' );
+delete_option( 'hsts_disable_referrer_policy' );
+delete_option( 'hsts_disable_x_permitted_cross_domain_policies' );
+delete_option( 'hsts_disable_cross_origin_opener_policy' );
+delete_option( 'hsts_disable_cross_origin_resource_policy' );
+delete_option( 'hsts_disable_access_control_allow_methods' );
+delete_option( 'hsts_disable_access_control_allow_headers' );
+
+// Legacy suppression flags (<= 5.3.3) - remove any residue.
 delete_option( 'disable_hsts_header' );
 delete_option( 'disable_csp_header' );
 delete_option( 'disable_x_content_type_options_header' );

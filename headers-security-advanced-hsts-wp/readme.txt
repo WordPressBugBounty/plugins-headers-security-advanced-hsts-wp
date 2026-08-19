@@ -171,19 +171,19 @@ Nothing existing moves behind a paywall. Revenue from Shield directly funds free
 
 = Will this plugin slow down my site? =
 
-No. Headers add less than 1KB to each response. The plugin uses WordPress native hooks and Apache .htaccess. Zero database queries at page load for visitors.
+No. Headers add less than 1KB to each response. The plugin uses WordPress native hooks and adds no database queries at page load for visitors.
 
 = Does it work with Nginx or LiteSpeed? =
 
-Yes. The PHP method (wp_headers filter) works on any server. The .htaccess method is Apache-only, but the plugin automatically uses the PHP method on other servers.
+Yes. As of version 5.3.4 the plugin sends every header a single time via PHP, on any server (Apache, LiteSpeed, Nginx, IIS). It no longer writes headers to .htaccess, so there is only one source and duplicate headers cannot occur.
 
 = Does it work with caching plugins? =
 
-Yes. Compatible with WP Super Cache, W3 Total Cache, LiteSpeed Cache, WP Rocket, and others.
+Yes, for normal PHP-served pages. One honest caveat: some page caches (for example WP Super Cache in "Expert"/mod_rewrite mode, or Cache Enabler) serve fully cached pages as static HTML straight from the web server, bypassing PHP entirely. Those specific responses do not receive the plugin's headers, because as of 5.3.4 the plugin emits headers only through PHP. Pages served through PHP (the default in most caches, including WP Super Cache "Simple" mode, W3 Total Cache, LiteSpeed Cache, WP Rocket) are unaffected. A dedicated option to cover static/rewrite-served responses is planned as an opt-in feature.
 
 = Does it work with Cloudflare? =
 
-Yes. Cloudflare passes through headers set by WordPress. If you also set headers in Cloudflare dashboard, use the "Resolve duplicate headers" option in Settings to avoid duplicates.
+Yes. Cloudflare passes through headers set by WordPress. If you also set the same headers in the Cloudflare dashboard, disable the matching header in the plugin Settings ("Disable individual headers") to avoid duplicates.
 
 = How do I get an A+ grade on SecurityHeaders.com? =
 
@@ -191,7 +191,7 @@ Your site needs all 6 scored headers present: Content-Security-Policy, Strict-Tr
 
 = Can it conflict with other security plugins? =
 
-Rarely. If another plugin sets the same headers, you may get duplicates. Use the "Resolve duplicate headers" checkboxes in Settings to fix this.
+Rarely. If another plugin or your server sets the same header, you may get duplicates. Open Settings and tick the matching box under "Disable individual headers" to stop this plugin emitting that one header.
 
 = What is HSTS? =
 
@@ -466,6 +466,20 @@ This will cause the <a href="https://developers.cloudflare.com/cache/how-to/purg
 9. Site-wide security setting
 
 == Changelog ==
+
+= 5.3.4 =
+This release fixes duplicate security headers and makes header delivery predictable on every server.
+
+- Fixed: Duplicate headers (Content-Security-Policy, Referrer-Policy, Cross-Origin-*, X-Permitted-Cross-Domain-Policies, Access-Control-Allow-Methods and others) that appeared on Apache and LiteSpeed when both PHP and .htaccess emitted them.
+- Changed: Headers are now sent a single time via PHP on all servers. The plugin no longer writes a header block to .htaccess, so there is exactly one source and no duplicates. Any block left by previous versions (including very old formats) is automatically removed on update.
+- Fixed: The "disable" checkboxes now work for every header, not just four, and they fully turn a header on or off. The checkboxes have been reset once during the update; a notice explains the change so no site silently loses a header it meant to keep.
+- Fixed: The checkbox previously labelled "CSP" actually controlled Permissions-Policy; it has been renamed. Because its meaning changed, it (and the other reset checkboxes) start unchecked. The update notice explains how to re-check any header you want disabled.
+- Removed: The deprecated X-Content-Security-Policy header (superseded by Content-Security-Policy).
+- Changed: Cross-Origin-Embedder-Policy is no longer sent by default (its previous "unsafe-none" value added no protection and used non-standard syntax).
+- Fixed: Removed invalid report-to='default' syntax from Cross-Origin headers.
+- Fixed: Rewrite rules are no longer flushed during plugin updates or settings saves (fixes multilingual routing breakage with Polylang and similar plugins).
+- Changed: The plugin's Content-Security-Policy is applied to the site front-end; wp-admin is left to WordPress core's own policy, so a strict CSP cannot break the block editor. All other security headers are still applied everywhere.
+- Note: static files (CSS, JS, images) served directly by the web server no longer receive security headers, since headers are now emitted via PHP only. The practical impact is X-Content-Type-Options on static assets. Server-level coverage will return as an explicit opt-in feature in a future release.
 
 = 5.3.3 =
 This update introduces **Shield** — optional advanced tools for professionals who need deeper security monitoring. Every existing feature remains completely free, forever.
