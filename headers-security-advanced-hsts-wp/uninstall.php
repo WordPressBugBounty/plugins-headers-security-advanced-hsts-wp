@@ -20,7 +20,55 @@ delete_option( 'hsts_csp_report_uri' );
 // Plugin state / migration bookkeeping.
 delete_option( 'hsts_plugin_db_version' );
 delete_option( 'hsts_show_migration_notice_v2' );
+delete_option( 'hsts_show_migration_notice_v3' );
 delete_option( 'hsts_htaccess_cleanup_pending' );
+
+// 5.3.5 writer / probe state.
+delete_option( 'hsts_htaccess_write_pending' );
+delete_option( 'hsts_htaccess_write_failed' );
+delete_option( 'hsts_htaccess_written_headers' );
+delete_option( 'hsts_htaccess_confirmed' );
+delete_option( 'hsts_probe_token' );
+delete_option( 'hsts_backend_endpoint' );
+delete_option( 'hsts_detected_server' );
+delete_transient( 'hsts_probe_lock' );
+delete_transient( 'hsts_run_check_throttle' );
+
+// Stop the background probe if it is still scheduled.
+$hsts_probe_event = wp_next_scheduled( 'hsts_probe_event' );
+if ( $hsts_probe_event ) {
+    wp_unschedule_event( $hsts_probe_event, 'hsts_probe_event' );
+}
+
+// Remove the managed .htaccess block (deactivation normally does this first;
+// repeated here so an uninstall on a site that skipped a clean deactivate does
+// not leave the block orphaned). Self-contained: the plugin code is not loaded
+// during uninstall. Anchored strictly to our version-free markers, and matches
+// legacy version-bearing markers too, so exactly one block is removed and the
+// WordPress rewrite block / user rules are never touched.
+if ( ! function_exists( 'WP_Filesystem' ) ) {
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+}
+if ( function_exists( 'WP_Filesystem' ) && WP_Filesystem() ) {
+    global $wp_filesystem;
+    $hsts_home     = function_exists( 'get_home_path' ) ? get_home_path() : ABSPATH;
+    $hsts_htaccess = $hsts_home . '.htaccess';
+    if ( $wp_filesystem->exists( $hsts_htaccess )
+        && $wp_filesystem->is_readable( $hsts_htaccess )
+        && $wp_filesystem->is_writable( $hsts_htaccess ) ) {
+        $hsts_contents = $wp_filesystem->get_contents( $hsts_htaccess );
+        if ( is_string( $hsts_contents ) ) {
+            $hsts_stripped = preg_replace(
+                '/\R?[^\S\r\n]*#[^\S\r\n]*BEGIN[^\S\r\n]+(?:WordPress[^\S\r\n]+)?Headers Security Advanced & HSTS WP\b.*?#[^\S\r\n]*END[^\S\r\n]+(?:WordPress[^\S\r\n]+)?Headers Security Advanced & HSTS WP[^\r\n]*/is',
+                '',
+                $hsts_contents
+            );
+            if ( is_string( $hsts_stripped ) && $hsts_stripped !== $hsts_contents ) {
+                $wp_filesystem->put_contents( $hsts_htaccess, $hsts_stripped );
+            }
+        }
+    }
+}
 
 // Per-header suppression flags (5.3.4+ naming).
 delete_option( 'hsts_disable_strict_transport_security' );
@@ -34,6 +82,19 @@ delete_option( 'hsts_disable_cross_origin_opener_policy' );
 delete_option( 'hsts_disable_cross_origin_resource_policy' );
 delete_option( 'hsts_disable_access_control_allow_methods' );
 delete_option( 'hsts_disable_access_control_allow_headers' );
+
+// Per-header delivery mode (5.3.5+ tri-state: on|server|off).
+delete_option( 'hsts_mode_strict_transport_security' );
+delete_option( 'hsts_mode_content_security_policy' );
+delete_option( 'hsts_mode_permissions_policy' );
+delete_option( 'hsts_mode_x_frame_options' );
+delete_option( 'hsts_mode_x_content_type_options' );
+delete_option( 'hsts_mode_referrer_policy' );
+delete_option( 'hsts_mode_x_permitted_cross_domain_policies' );
+delete_option( 'hsts_mode_cross_origin_opener_policy' );
+delete_option( 'hsts_mode_cross_origin_resource_policy' );
+delete_option( 'hsts_mode_access_control_allow_methods' );
+delete_option( 'hsts_mode_access_control_allow_headers' );
 
 // Legacy suppression flags (<= 5.3.3) - remove any residue.
 delete_option( 'disable_hsts_header' );

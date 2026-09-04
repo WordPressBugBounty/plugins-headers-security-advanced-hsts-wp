@@ -4,7 +4,7 @@ Donate link: https://www.buymeacoffee.com/tentacleplugins
 Tags: headers security, hsts, headers, clickjacking, csp
 Requires at least: 4.7
 Tested up to: 7.0
-Stable tag: 5.3.3
+Stable tag: 5.3.5
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -175,15 +175,15 @@ No. Headers add less than 1KB to each response. The plugin uses WordPress native
 
 = Does it work with Nginx or LiteSpeed? =
 
-Yes. As of version 5.3.4 the plugin sends every header a single time via PHP, on any server (Apache, LiteSpeed, Nginx, IIS). It no longer writes headers to .htaccess, so there is only one source and duplicate headers cannot occur.
+Yes. On Apache and LiteSpeed the plugin writes the headers to .htaccess so the web server applies them to every response, including cached HTML and static files, and PHP does not emit a duplicate. On Nginx and IIS (which do not read .htaccess) the headers are sent via PHP, so your normal pages are covered; if you run a server-level cache there, add the equivalent rules to the server config (the plugin's Settings page shows the exact snippet).
 
 = Does it work with caching plugins? =
 
-Yes, for normal PHP-served pages. One honest caveat: some page caches (for example WP Super Cache in "Expert"/mod_rewrite mode, or Cache Enabler) serve fully cached pages as static HTML straight from the web server, bypassing PHP entirely. Those specific responses do not receive the plugin's headers, because as of 5.3.4 the plugin emits headers only through PHP. Pages served through PHP (the default in most caches, including WP Super Cache "Simple" mode, W3 Total Cache, LiteSpeed Cache, WP Rocket) are unaffected. A dedicated option to cover static/rewrite-served responses is planned as an opt-in feature.
+Yes. On Apache and LiteSpeed the headers are served at the web-server layer (.htaccess), so they are present even on fully cached pages and on static files that never invoke PHP - including caches that serve static HTML through mod_rewrite: W3 Total Cache (including Disk: Enhanced), WP Super Cache (both "Simple" and "Expert"/mod_rewrite modes), Cache Enabler and WP Fastest Cache. On Nginx and IIS those .htaccess rewrite rules are not read, so a server-level cache that serves HTML without PHP needs the equivalent headers added to the server config by your host; pages served through PHP are covered as usual. Note on WP Rocket: it serves its cache through an early advanced-cache.php drop-in that runs before plugins load, so we do not yet claim coverage for its cached responses on any stack - we have modelled this but not verified it on a live WP Rocket site. If you use WP Rocket, check the cached responses with your browser's network tab and, if a header is missing, add the equivalent rule at the server or CDN level.
 
 = Does it work with Cloudflare? =
 
-Yes. Cloudflare passes through headers set by WordPress. If you also set the same headers in the Cloudflare dashboard, disable the matching header in the plugin Settings ("Disable individual headers") to avoid duplicates.
+Yes. Cloudflare passes through headers set by WordPress. If you also set the same headers in the Cloudflare dashboard, open Settings → "Advanced: per-header delivery" and set the matching header to "Off" to avoid duplicates.
 
 = How do I get an A+ grade on SecurityHeaders.com? =
 
@@ -191,7 +191,7 @@ Your site needs all 6 scored headers present: Content-Security-Policy, Strict-Tr
 
 = Can it conflict with other security plugins? =
 
-Rarely. If another plugin or your server sets the same header, you may get duplicates. Open Settings and tick the matching box under "Disable individual headers" to stop this plugin emitting that one header.
+Rarely. The plugin detects and resolves its own duplicates automatically. If another plugin or your server sets the same header and a duplicate remains, open Settings → "Advanced: per-header delivery" and set that header to "Server only" (keep the server copy, drop the plugin copy) or "Off".
 
 = What is HSTS? =
 
@@ -395,6 +395,12 @@ Are you experiencing any anomalies after a plugin update? If yes, please follow 
 
 This will cause the <a href="https://developers.cloudflare.com/cache/how-to/purge-cache/" target="_blank">cloudFlare</a>
 
+== Known limitations ==
+
+* Automatic duplicate resolution needs a self-check that reaches your site's PHP over a loopback connection. On some reverse-proxy stacks - notably nginx in front of Apache, which is the default on Plesk and cPanel - the backend selects the virtual host by TLS SNI, so a loopback request answers 421 (Misdirected Request) and the self-check cannot arm. When this happens the plugin does not de-duplicate automatically; it keeps sending every header via PHP (nothing is lost), and the Delivery diagnostics panel says so. If a header ends up duplicated on such a stack, set it to "Server only" under "Advanced: per-header delivery" - that keeps the server's copy and drops the plugin's own. A future release will make the loopback self-check pin the request to the backend so it can arm automatically on these stacks too.
+* Content-Security-Policy is always sent via PHP on the front-end only and is never written to .htaccess, so a strict or nonce-based CSP cannot reach wp-admin or be frozen into a cached response.
+* On Nginx and IIS the plugin does not write .htaccess (those servers do not read it). Normal pages are covered via PHP; a server-level cache that serves HTML without invoking PHP needs the equivalent headers added to the server or CDN config. WP Rocket's cache is served by an early advanced-cache.php drop-in that runs before plugins load; we have modelled this but not verified coverage on a live WP Rocket site, so check its cached responses and add a server or CDN rule if a header is missing.
+
 == Installation ==
 
 = ITALIAN =
@@ -466,6 +472,18 @@ This will cause the <a href="https://developers.cloudflare.com/cache/how-to/purg
 9. Site-wide security setting
 
 == Changelog ==
+
+= 5.3.5 =
+This release brings back server-level header coverage (cached pages and static files) that 5.3.4 lost, without reintroducing duplicate headers.
+
+- Fixed: On full-page caches and static files (CSS, JS, images) the security headers were missing after 5.3.4, because headers were emitted only through PHP and those responses never run PHP. External scanners could report the headers as gone. The plugin now writes the headers to .htaccess again on Apache and LiteSpeed, so the web server applies them to every response.
+- Added: Automatic de-duplication is available but is turned off by default in this version. The plugin writes the header to .htaccess and PHP keeps sending it too. On Apache the .htaccess directive replaces, so you still get a single copy. On LiteSpeed .htaccess appends instead, so if a header shows up twice, set that header to "Server only" under "Advanced: per-header delivery" to keep the server's copy and drop the plugin's. When automatic de-duplication is enabled, the plugin confirms - by measuring its own live responses - that the server is already sending a header before it stops sending its own copy; if that proof is missing, stale, or uncertain it keeps sending. It always errs toward sending, never toward a missing header.
+- Added: A "Run check now" button on the settings page (Delivery diagnostics) shows which web server was detected, whether the .htaccess block is in place, the backend port the plugin learned (or that it has not learned one yet), the exact loopback candidates tried and the responding server, so header delivery can be verified at a glance.
+- Added: Per-header delivery control under "Advanced: per-header delivery" (collapsed by default). Each header can be left on "On" (the plugin manages it: it writes the header to .htaccess and PHP sends it), set to "Server only" (keep the server's or another plugin's copy and drop the plugin's own), or "Off" (do not send it at all). With automatic de-duplication off by default in this version, this selector is the primary way to resolve a duplicate: on LiteSpeed, set the affected header to "Server only". The diagnostics panel points here when it detects a duplicate it cannot resolve on its own.
+- Added: On Nginx and IIS the plugin does not write .htaccess (those servers do not read it) and instead shows the exact server-config snippet to hand to your host for server-level caches. Normal pages remain covered via PHP.
+- Safety: Every .htaccess write is verified over HTTP and automatically rolled back to the previous file if the site returns an error, and the block is wrapped so a server without mod_headers simply ignores it. The block uses stable markers so upgrades replace it in place instead of stacking, and it is removed on deactivation and uninstall.
+- Changed: Any header you had previously disabled is preserved as "Off" under the new per-header delivery control, so no header you intentionally turned off comes back.
+- Note: Content-Security-Policy continues to be sent via PHP on the front-end only (never written to .htaccess), so a strict or nonce-based policy cannot reach wp-admin or be frozen into a cached file.
 
 = 5.3.4 =
 This release fixes duplicate security headers and makes header delivery predictable on every server.

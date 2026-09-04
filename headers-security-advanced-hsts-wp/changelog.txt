@@ -1,3 +1,59 @@
+= 5.3.5 =
+This release brings back server-level header coverage (cached pages and static files) that 5.3.4 lost, without reintroducing duplicate headers.
+
+- Fixed: On full-page caches and static files (CSS, JS, images) the security headers were missing after 5.3.4, because headers were emitted only through PHP and those responses never run PHP. External scanners could report the headers as gone. The plugin now writes the headers to .htaccess again on Apache and LiteSpeed, so the web server applies them to every response.
+- Added: A single, proven decision keeps duplicate headers from coming back. On servers where .htaccess would otherwise append a second copy (LiteSpeed), the plugin confirms - by measuring its own live responses - that the server is already sending a header before it stops sending its own copy of it. If that proof is missing, stale, or uncertain, the plugin keeps sending the header. It always errs toward sending, never toward a missing header.
+- Added: A "Run check now" button on the settings page (Delivery diagnostics) shows which web server was detected, whether the .htaccess block is in place, the backend port the plugin learned (or that it has not learned one yet), the exact loopback candidates tried and the responding server, so header delivery can be verified at a glance.
+- Added: Per-header delivery control under "Advanced: per-header delivery" (collapsed by default). Each header can be left on "On" (the plugin manages it and resolves duplicates automatically), set to "Server only" (keep the server or another plugin's copy and drop the plugin's own), or "Off" (do not send it at all). Automatic duplicate resolution stays the primary mechanism; this selector is the manual fallback for stacks where the automatic check cannot arm, and the diagnostics panel points here when it finds a duplicate it cannot resolve on its own.
+- Added: On Nginx and IIS the plugin does not write .htaccess (those servers do not read it) and instead shows the exact server-config snippet to hand to your host for server-level caches. Normal pages remain covered via PHP.
+- Safety: Every .htaccess write is verified over HTTP and automatically rolled back to the previous file if the site returns an error, and the block is wrapped so a server without mod_headers simply ignores it. The block uses stable markers so upgrades replace it in place instead of stacking, and it is removed on deactivation and uninstall.
+- Changed: Any header you had previously disabled is preserved as "Off" under the new per-header delivery control, so no header you intentionally turned off comes back.
+- Note: Content-Security-Policy continues to be sent via PHP on the front-end only (never written to .htaccess), so a strict or nonce-based policy cannot reach wp-admin or be frozen into a cached file.
+
+= 5.3.4 =
+This release fixes duplicate security headers and makes header delivery predictable on every server.
+
+- Fixed: Duplicate headers (Content-Security-Policy, Referrer-Policy, Cross-Origin-*, X-Permitted-Cross-Domain-Policies, Access-Control-Allow-Methods and others) that appeared on Apache and LiteSpeed when both PHP and .htaccess emitted them.
+- Changed: Headers are now sent a single time via PHP on all servers. The plugin no longer writes a header block to .htaccess, so there is exactly one source and no duplicates. Any block left by previous versions (including very old formats) is automatically removed on update.
+- Fixed: The "disable" checkboxes now work for every header, not just four, and they fully turn a header on or off. The checkboxes have been reset once during the update; a notice explains the change so no site silently loses a header it meant to keep.
+- Fixed: The checkbox previously labelled "CSP" actually controlled Permissions-Policy; it has been renamed. Because its meaning changed, it (and the other reset checkboxes) start unchecked. The update notice explains how to re-check any header you want disabled.
+- Removed: The deprecated X-Content-Security-Policy header (superseded by Content-Security-Policy).
+- Changed: Cross-Origin-Embedder-Policy is no longer sent by default (its previous "unsafe-none" value added no protection and used non-standard syntax).
+- Fixed: Removed invalid report-to='default' syntax from Cross-Origin headers.
+- Fixed: Rewrite rules are no longer flushed during plugin updates or settings saves (fixes multilingual routing breakage with Polylang and similar plugins).
+- Changed: The plugin's Content-Security-Policy is applied to the site front-end; wp-admin is left to WordPress core's own policy, so a strict CSP cannot break the block editor. All other security headers are still applied everywhere.
+- Note: static files (CSS, JS, images) served directly by the web server no longer receive security headers, since headers are now emitted via PHP only. The practical impact is X-Content-Type-Options on static assets. Server-level coverage will return as an explicit opt-in feature in a future release.
+
+= 5.3.3 =
+This update introduces **Shield** — optional advanced tools for professionals who need deeper security monitoring. Every existing feature remains completely free, forever.
+
+- New: Shield tab-based interface (Settings, Dashboard, CSP, Notifications, Export/Import, License, Free vs Shield, FAQ)
+- New: Security Advisor with personalized recommendations
+- New: Security Score Dashboard (A+ to F grading, 10 header status overview)
+- New: CSP Guide with recommended tools (Csper.io, Google CSP Evaluator, Report URI, URIports)
+- New: CSP violation analytics (top blocked domains, directives, trends)
+- New: Email alerts when security score drops or headers change
+- New: Webhook notifications (Slack, Discord, Microsoft Teams, custom JSON endpoint)
+- New: Export/Import settings for agencies managing multiple sites
+- New: Weekly automated scans with history tracking
+- New: Comprehensive FAQ with search and category filters
+- New: Free vs Shield comparison with transparent pricing
+- Improved: Clean uninstall (license auto-deactivated, all options removed)
+
+= 5.2.5 =
+I don't want to tell you what to do, but here's the thing: When you update the Headers Security Advanced & HSTS WP plugin, you don't just click a button, you enter a world of enhanced security and performance.
+
+With version 5.2.5, I have gone above and beyond to ensure that your experience is nothing short of exceptional. I have eliminated numerous bugs, improved annoying pixels, and updated the graphics in a sleek and modern way. The result? A plugin that not only looks great, but works even better.
+
+But that's not all. This update brings seamless integration with the industry's leading security monitoring platforms-Sentry, Datadog, and Report URI. These integrations offer enhanced reporting capabilities, providing detailed information on content security policy (CSP) violations and improving site security.
+
+- Update: Code optimization for better compatibility with WordPress version 6.9.
+- Fixed: Improved compatibility with WordPress 6.9 plugin list rendering
+- Fixed: Resolved edge case where plugin list could stop rendering when other plugins return unexpected values from the `plugin_action_links` filter
+- Hardened: Added defensive type checking for better interoperability with third-party plugins
+
+By updating to 5.2.5, you’re not just improving your site’s security – you’re optimizing it with the best tools available. Our goal is to provide you with the most beautiful, fastest, and most impressive plugin experience around. So, shall we get started? Hit "update" and step into a new era of security and performance with Headers Security Advanced & HSTS WP. Enjoy the upgrade!
+
 = 5.2.4 =
 I don't want to tell you what to do, but here's the thing: When you update the Headers Security Advanced & HSTS WP plugin, you don't just click a button, you enter a world of enhanced security and performance.
 

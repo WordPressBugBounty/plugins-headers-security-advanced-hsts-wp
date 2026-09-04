@@ -3,7 +3,7 @@
  * Plugin Name: Headers Security Advanced & HSTS WP
  * Plugin URI: https://openheaders.org
  * Description: Headers Security Advanced & HSTS WP - Simple, Light and Fast. The plugin uses advanced security rules that provide huge levels of protection and it is important that your site uses it. This step is important to submit your website and/or domain to an approved HSTS list. Google officially compiles this list and it is used by Chrome, Firefox, Opera, Safari, IE11 and Edge. You can forward your site to the official HSTS preload directory. Cross Site Request Forgery (CSRF) is a common attack with the installation of Headers Security Advanced & HSTS WP will help you mitigate CSRF on your WordPress site.
- * Version: 5.3.4
+ * Version: 5.3.5
  * Text Domain: headers-security-advanced-hsts-wp
  * Domain Path: /languages
  * Author: 🐙 Andrea Ferro
@@ -23,7 +23,7 @@ if ( ! function_exists( 'add_action' ) ) {
     die( 'Don\'t try to be smart with us, only real ninjas can enter here!' );
 }
 
-const HSTS_PLUGIN_VERSION = '5.3.4';
+const HSTS_PLUGIN_VERSION = '5.3.5';
 const HSTS_STANDARD_VALUE_CSP = 'upgrade-insecure-requests;';
 const HSTS_STANDARD_VALUE_PERMISSIONS_POLICY = 'accelerometer=(), autoplay=(), camera=(), cross-origin-isolated=(), display-capture=(self), encrypted-media=(), fullscreen=*, geolocation=(self), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), payment=*, picture-in-picture=*, publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=*, usb=(), xr-spatial-tracking=(), gamepad=(), serial=()';
 
@@ -31,19 +31,29 @@ const HSTS_STANDARD_VALUE_PERMISSIONS_POLICY = 'accelerometer=(), autoplay=(), c
  * DB schema version for the plugin options. Bumped when a migration is needed.
  *   1 (implicit) = <= 5.3.3, dual emission (PHP wp_headers filter + .htaccess block).
  *   2            = 5.3.4, single-source PHP emission, no .htaccess writing.
+ *   3            = 5.3.5, .htaccess writer restored + probe token seeded. PHP
+ *                  keeps emitting; it self-suppresses a header only on a fresh,
+ *                  proven confirmation (see includes/htaccess-writer.php). The
+ *                  suppression half ships behind a feature flag (default off).
  */
-const HSTS_PLUGIN_DB_VERSION = 2;
+const HSTS_PLUGIN_DB_VERSION = 3;
+
+// .htaccess writer + self-suppression diagnostic probe. Loaded early so its
+// hooks (init cron sync, option-change re-sync) register during plugin load.
+require_once __DIR__ . '/includes/htaccess-writer.php';
 
 /**
  * Canonical list of the security headers this plugin manages.
  *
- * Single source of truth: this drives the runtime dispatcher (below). The
- * plugin no longer writes any of these to .htaccess, so there is exactly one
- * emission path and duplicates cannot occur regardless of server type.
+ * Single source of truth: this drives both emission paths - the runtime PHP
+ * dispatcher (below) and the .htaccess writer. On Apache/LiteSpeed the block is
+ * written to .htaccess so cached and static responses are covered too; PHP
+ * remains the source on dynamic pages. Duplicate headers are resolved by the
+ * plugin itself (automatic self-suppression, plus the per-header delivery mode).
  *
  * Each entry: header name => [ 'value' => callable|string, 'option' => suppression option key ].
- * When the suppression option is truthy the header is not emitted at all
- * ("do not emit this header from the plugin" - no server-side magic).
+ * The per-header delivery mode (on|server|off) is derived from that option key;
+ * 'off' means the plugin does not emit the header at all.
  *
  * Intentionally removed in 5.3.4:
  *   - X-Content-Security-Policy  (deprecated IE-only header, hard removal)
@@ -69,8 +79,51 @@ function hsts_plugin_managed_header_map(): array {
 }
 
 /**
+ * The tri-state option key for a header, derived from its legacy disable-flag
+ * key: hsts_disable_<slug> -> hsts_mode_<slug>.
+ */
+function hsts_plugin_header_mode_option( string $disable_option ): string {
+    return 'hsts_mode_' . substr( $disable_option, strlen( 'hsts_disable_' ) );
+}
+
+/**
+ * Effective per-header delivery mode: 'on' | 'server' | 'off'.
+ *
+ *   on     - emit from PHP (+ .htaccess where supported). Default.
+ *   server - keep writing it to .htaccess but drop the plugin's PHP copy, so
+ *            the server layer is the single source (manual de-duplication).
+ *   off    - remove entirely (neither PHP nor .htaccess).
+ *
+ * Reads the explicit tri-state option when set to a known value; otherwise
+ * falls back to the legacy per-header disable flag so a box ticked BEFORE this
+ * version keeps its original meaning (ticked = fully off) and never silently
+ * becomes "server only".
+ */
+function hsts_plugin_header_mode( string $disable_option ): string {
+    $mode = get_option( hsts_plugin_header_mode_option( $disable_option ), '' );
+    if ( 'on' === $mode || 'server' === $mode || 'off' === $mode ) {
+        return $mode;
+    }
+    return get_option( $disable_option ) ? 'off' : 'on';
+}
+
+/**
+ * Resolve the tri-state mode from a header NAME (as emitted). Headers with no
+ * toggle (e.g. the CSP report-only channel) are always 'on'.
+ */
+function hsts_plugin_header_mode_by_name( string $name ): string {
+    $map = hsts_plugin_managed_header_map();
+    if ( isset( $map[ $name ]['option'] ) ) {
+        return hsts_plugin_header_mode( $map[ $name ]['option'] );
+    }
+    return 'on';
+}
+
+/**
  * Build the ordered name => value map of headers to emit, honouring the
- * per-header suppression options. Empty values are skipped by the dispatcher.
+ * per-header modes. Only 'off' headers are dropped here; 'server' headers are
+ * kept (the writer needs them in .htaccess, and send_headers decides whether to
+ * also emit the PHP copy). Empty values are skipped by the dispatcher.
  *
  * @return array<string, string>
  */
@@ -78,17 +131,17 @@ function hsts_plugin_get_managed_headers(): array {
     $headers = array();
 
     foreach ( hsts_plugin_managed_header_map() as $name => $def ) {
-        if ( get_option( $def['option'] ) ) {
-            continue; // Explicitly suppressed: do not emit from the plugin.
+        if ( 'off' === hsts_plugin_header_mode( $def['option'] ) ) {
+            continue; // Fully off: neither PHP nor .htaccess.
         }
         $value          = is_callable( $def['value'] ) ? call_user_func( $def['value'] ) : $def['value'];
         $headers[ $name ] = (string) $value;
     }
 
     // Optional CSP report-only channel, only when a report URI is configured
-    // and the CSP header itself is not suppressed.
+    // and the CSP header itself is not turned off.
     $report_uri = get_option( 'hsts_csp_report_uri' );
-    if ( ! empty( $report_uri ) && ! get_option( 'hsts_disable_content_security_policy' ) ) {
+    if ( ! empty( $report_uri ) && 'off' !== hsts_plugin_header_mode( 'hsts_disable_content_security_policy' ) ) {
         $headers['Content-Security-Policy-Report-Only'] = (string) hsts_plugin_get_csp_report_only_header();
     }
 
@@ -110,7 +163,7 @@ function hsts_plugin_get_managed_headers(): array {
  * eliminate duplicate headers everywhere; .htaccess coverage for static
  * files may return as an explicit opt-in in a future release.
  *
- * Content-Security-Policy is intentionally NOT emitted in the admin/login
+ * Content-Security-Policy is intentionally not emitted in the admin/login
  * context. A user's restrictive front-end CSP would otherwise reach wp-admin
  * (which it historically did not, because the old .htaccess block sat on the
  * front-end rewrite path) and could break the block editor or login screen.
@@ -129,9 +182,57 @@ function hsts_plugin_send_headers(): void {
         return;
     }
 
+    // No-emit self-check branch. This is the only way to obtain a page without
+    // the security headers, and it is how the diagnostic probe measures what
+    // the server layer (.htaccess) emits on its own (n_off). It arms only for a
+    // loopback request carrying the per-site secret (see the locks in
+    // hsts_plugin_is_selfcheck_request), so it is unreachable from outside.
+    // Kept available regardless of the suppression feature flag so that "Run
+    // check now" works even while passive suppression is off.
+    if ( hsts_plugin_is_selfcheck_request() ) {
+        header( 'X-Hsts-Selfcheck: 1' ); // sentinel: proves the branch ran on our vhost
+        header( 'Cache-Control: no-store' ); // never cache a header-less response
+        return;
+    }
+
     $admin_context = hsts_plugin_is_admin_context();
+    $suppress      = hsts_plugin_suppression_enabled();
+
+    // Learn the backend's loopback port so the probe can reach it directly (see
+    // hsts_plugin_capture_backend_endpoint). No context guard here: the capture
+    // itself only records when SERVER_ADDR is a loopback literal, which is
+    // exactly the request class served through the .htaccess-reading backend and
+    // never the explicit-.php-to-FPM path (public address). Running it on every
+    // dynamic hit - front-end, admin, login, REST - maximises the chance of
+    // learning the port on heavily cached sites where front-end PHP rarely runs.
+    if ( function_exists( 'hsts_plugin_capture_backend_endpoint' ) ) {
+        hsts_plugin_capture_backend_endpoint();
+    }
+
+    // Record the server family from this real request so the .htaccess write
+    // decision (which also runs in php-cli cron / WP-CLI, where SERVER_SOFTWARE
+    // is unset) stays aligned with the server actually serving the site.
+    if ( function_exists( 'hsts_plugin_remember_server' ) ) {
+        hsts_plugin_remember_server();
+    }
 
     foreach ( hsts_plugin_headers_for_context( hsts_plugin_get_managed_headers(), $admin_context ) as $name => $value ) {
+        // (1) Automatic suppression - the primary mechanism. Drop PHP's own copy
+        // only on a fresh, proven confirmation that the server layer already
+        // emits this header on the dynamic response class.
+        if ( $suppress && hsts_plugin_htaccess_confirmed( $name ) ) {
+            continue;
+        }
+        // (2) Manual "server only" - the fallback for stacks where the probe
+        // cannot arm. The admin chose to drop the PHP copy and let the server
+        // serve it; honour that only when the server actually covers this header
+        // (Apache/LiteSpeed with our block present). Otherwise emit from PHP so
+        // the header is never silently lost - fail toward emit.
+        if ( 'server' === hsts_plugin_header_mode_by_name( $name )
+            && function_exists( 'hsts_plugin_server_covers_header' )
+            && hsts_plugin_server_covers_header( $name ) ) {
+            continue;
+        }
         header( sprintf( '%s: %s', $name, $value ), true );
     }
 }
@@ -519,24 +620,28 @@ function hsts_plugin_settings_page(): void {
 
                     </td>
                     <br />
-                    <h4 class="HeaderSecurityAdvancedHSTSWPROSHUEtboxy1440"><?php esc_html_e( 'Disable individual headers:', 'headers-security-advanced-hsts-wp' ); ?></h4>
-                    <p>
-                        <span class="HeaderSecurityAdvancedHSTSWPROSHUEctd3">
-                            <?php esc_html_e( 'Tick a header to stop the plugin from emitting it. Headers are sent a single time via PHP (never written to .htaccess), so enabling a box here removes that header entirely rather than just de-duplicating it. Use this if another plugin or your server already sets the same header.', 'headers-security-advanced-hsts-wp' ); ?>
-                        </span>
-                    </p>
-                    <br />
-                    <?php foreach ( hsts_plugin_managed_header_map() as $hsts_header_name => $hsts_header_def ) : ?>
-                        <div class="HeaderSecurityAdvancedHSTSWPROSHUEbadge2450">
-                            <label for="<?php echo esc_attr( $hsts_header_def['option'] ); ?>">
-                                <input type="checkbox" id="<?php echo esc_attr( $hsts_header_def['option'] ); ?>" name="<?php echo esc_attr( $hsts_header_def['option'] ); ?>" value="1" <?php checked( 1, get_option( $hsts_header_def['option'] ), true ); ?>/>
-                                <?php
-                                /* translators: %s: HTTP header name. */
-                                printf( esc_html__( 'Disable (%s).', 'headers-security-advanced-hsts-wp' ), esc_html( $hsts_header_name ) );
-                                ?>
-                            </label><br/>
-                        </div>
-                    <?php endforeach; ?>
+                    <details class="HeaderSecurityAdvancedHSTSWPROSHUEadvanced" style="margin-top:10px;">
+                        <summary style="cursor:pointer; font-weight:600;"><?php esc_html_e( 'Advanced: per-header delivery', 'headers-security-advanced-hsts-wp' ); ?></summary>
+                        <p>
+                            <span class="HeaderSecurityAdvancedHSTSWPROSHUEctd3">
+                                <?php esc_html_e( 'Leave every header on "On" unless you actually have a duplicate. On Apache and LiteSpeed the plugin writes these headers to your .htaccess so they cover cached and static responses, and also emits them from PHP on dynamic pages, removing any duplicate automatically. If a duplicate still remains on your server, set that header to "Server only": the plugin keeps the .htaccess copy and drops its own PHP copy, so the header is served exactly once and is never lost. "Off" removes the header entirely. If your server does not read .htaccess (nginx, IIS), "Server only" safely behaves like "On" and the header keeps coming from PHP.', 'headers-security-advanced-hsts-wp' ); ?>
+                            </span>
+                        </p>
+                        <?php
+                        foreach ( hsts_plugin_managed_header_map() as $hsts_header_name => $hsts_header_def ) :
+                            $hsts_mode_key = hsts_plugin_header_mode_option( $hsts_header_def['option'] );
+                            $hsts_mode_cur = hsts_plugin_header_mode( $hsts_header_def['option'] );
+                            ?>
+                            <div class="HeaderSecurityAdvancedHSTSWPROSHUEbadge2450" style="display:flex; align-items:center; gap:10px; margin:5px 0; flex-wrap:wrap;">
+                                <label for="<?php echo esc_attr( $hsts_mode_key ); ?>" style="min-width:320px;"><code><?php echo esc_html( $hsts_header_name ); ?></code></label>
+                                <select id="<?php echo esc_attr( $hsts_mode_key ); ?>" name="<?php echo esc_attr( $hsts_mode_key ); ?>">
+                                    <option value="on" <?php selected( 'on', $hsts_mode_cur ); ?>><?php esc_html_e( 'On (default)', 'headers-security-advanced-hsts-wp' ); ?></option>
+                                    <option value="server" <?php selected( 'server', $hsts_mode_cur ); ?>><?php esc_html_e( 'Server only (de-duplicate)', 'headers-security-advanced-hsts-wp' ); ?></option>
+                                    <option value="off" <?php selected( 'off', $hsts_mode_cur ); ?>><?php esc_html_e( 'Off', 'headers-security-advanced-hsts-wp' ); ?></option>
+                                </select>
+                            </div>
+                        <?php endforeach; ?>
+                    </details>
                 </tr>
 
             </table>
@@ -584,13 +689,28 @@ function hsts_plugin_settings_init(): void {
     register_setting( 'hsts-plugin-settings-group', 'hsts_x_frame_options_allow_from_url');
     register_setting( 'hsts-plugin-settings-group', 'hsts_csp_report_uri', 'sanitize_text_field');
 
-    // Per-header suppression flags. As of 5.3.4 every managed header has an
-    // explicit "do not emit this header from the plugin" flag (not just four),
-    // and they act on the single PHP emission source.
+    // Per-header delivery mode (tri-state: on | server | off). Replaces the
+    // old boolean disable flag; the legacy flag is still read as a fallback in
+    // hsts_plugin_header_mode() so a box ticked before this version keeps its
+    // original meaning (ticked = off).
     foreach ( hsts_plugin_managed_header_map() as $def ) {
-        register_setting( 'hsts-plugin-settings-group', $def['option'], 'intval' );
+        register_setting(
+            'hsts-plugin-settings-group',
+            hsts_plugin_header_mode_option( $def['option'] ),
+            array( 'sanitize_callback' => 'hsts_plugin_sanitize_header_mode' )
+        );
     }
 
+}
+
+/**
+ * Whitelist the per-header mode to a known value; anything else is coerced to
+ * the safe default ('on' = emit), so a malformed POST can never disable or
+ * mangle a header.
+ */
+function hsts_plugin_sanitize_header_mode( $value ): string {
+    $value = is_string( $value ) ? $value : '';
+    return in_array( $value, array( 'on', 'server', 'off' ), true ) ? $value : 'on';
 }
 add_action( 'admin_init', 'hsts_plugin_settings_init' );
 
@@ -678,10 +798,10 @@ function hsts_plugin_get_x_frame_options_header(): string {
 }
 
 /**
- * As of 5.3.4 the plugin no longer writes any header block to .htaccess:
- * headers are emitted exclusively via PHP (single source, no duplicates).
- * This function is retained only to REMOVE any legacy block left behind by
- * 5.3.x or older, and is safe to call repeatedly (idempotent).
+ * Legacy shim. 5.3.4 removed the .htaccess block; 5.3.5 restores it through the
+ * dedicated writer in includes/htaccess-writer.php. This wrapper only strips any
+ * block so callers that expected the old "cleanup" contract keep working; it is
+ * safe to call repeatedly (idempotent).
  */
 function hsts_plugin_update_htaccess(): bool {
     return hsts_plugin_cleanup_htaccess();
@@ -715,6 +835,13 @@ function hsts_plugin_maybe_migrate_legacy_csp(): void {
 }
 
 function hsts_plugin_activate(): void {
+    // Detect a brand-new install BEFORE we add any default options: no stored
+    // schema version and no long-standing option (hsts_max_age has shipped for
+    // years). A fresh install has no legacy behaviour to migrate from and
+    // nothing to warn about, so it must skip the upgrade-only migration notice.
+    $is_fresh_install = ( false === get_option( 'hsts_plugin_db_version', false ) )
+        && ( false === get_option( 'hsts_max_age', false ) );
+
     if ( ! get_option( 'hsts_max_age' ) ) {
         add_option( 'hsts_max_age', '63072000' );
     }
@@ -734,12 +861,26 @@ function hsts_plugin_activate(): void {
         add_option( 'hsts_x_frame_options', 'SAMEORIGIN' );
     }
 
+    if ( $is_fresh_install ) {
+        // Mark the schema current so the upgrade-only migrations (and their
+        // one-time admin notice) never run for a site that started life on this
+        // version. The managed .htaccess block is still written below.
+        update_option( 'hsts_plugin_db_version', HSTS_PLUGIN_DB_VERSION );
+    }
+
     hsts_plugin_maybe_migrate_legacy_csp();
 
-    // Run the full data migration on activation too, so a fresh activate of
-    // 5.3.4 over an existing 5.3.x install cleans up immediately rather than
-    // waiting for the next page load.
+    // Run the full data migration on activation too, so a fresh activate over
+    // an existing 5.3.x install migrates immediately rather than waiting for
+    // the next page load.
     hsts_plugin_run_migrations();
+
+    // Always (re)write the managed block on activation. run_migrations only
+    // writes when crossing into v3, so a plain reactivation (already v3, block
+    // removed on the prior deactivation) would otherwise come back headerless
+    // at the server layer until the next settings save.
+    hsts_plugin_write_htaccess();
+    hsts_plugin_schedule_probe();
 }
 register_activation_hook( __FILE__, 'hsts_plugin_activate' );
 
@@ -767,6 +908,9 @@ function hsts_plugin_cleanup_htaccess(): bool {
     if ( ! $filesystem->exists( $htaccess_file ) ) {
         // No .htaccess at all (nginx, or never created): nothing to clean, and
         // nothing can appear later that we'd need to strip. Definitively done.
+        if ( function_exists( 'hsts_plugin_set_written_headers' ) ) {
+            hsts_plugin_set_written_headers( null );
+        }
         return true;
     }
 
@@ -799,6 +943,12 @@ function hsts_plugin_cleanup_htaccess(): bool {
         // Pro). Deleting the cached option makes WordPress rebuild the rules
         // lazily on a later request, after init, when everything is present.
         hsts_plugin_schedule_soft_rewrite_flush();
+    }
+
+    // The managed block is gone: drop the coverage record so a "server only"
+    // header falls back to PHP emission instead of being silently lost.
+    if ( function_exists( 'hsts_plugin_set_written_headers' ) ) {
+        hsts_plugin_set_written_headers( null );
     }
 
     return true;
@@ -835,7 +985,7 @@ function hsts_plugin_schedule_soft_rewrite_flush(): void {
  * and are idempotent (running again over cleaned content changes nothing).
  *
  * Known accepted residue: 5.0.20's buggy updater could append a bare
- * "Header set Strict-Transport-Security" line with NO marker. It is
+ * "Header set Strict-Transport-Security" line with no marker. It is
  * unmatchable by any marker-anchored regex and is deliberately left in place
  * (a structural pass keyed on "Header set" would risk eating other plugins'
  * directives).
@@ -872,15 +1022,15 @@ function hsts_plugin_delete_old_options(): void {
  * Version-gated, idempotent data migration.
  *
  * Runs on every load via plugins_loaded but does real work only when the
- * stored DB version is behind. This is deliberately NOT driven by
- * upgrader_process_complete: that hook runs with the OLD code loaded and does
+ * stored DB version is behind. This is deliberately not driven by
+ * upgrader_process_complete: that hook runs with the old code loaded and does
  * not fire for every update path (manual upload, WP-CLI, staging sync, etc.).
  * A version option checked at runtime covers all of them exactly once.
  *
  * Migration to DB v2 (5.3.4):
  *   - Strip any leftover .htaccess header block (dual-emission source), with
  *     retry via hsts_htaccess_cleanup_pending if the filesystem is unavailable.
- *   - Reset (delete, do NOT copy forward) all 4 legacy disable_* flags: their
+ *   - Reset (delete, do not copy forward) all 4 legacy disable_* flags: their
  *     semantics changed (they used to disable only the PHP side while .htaccess
  *     kept emitting; now a single source honours them fully). The mis-named
  *     disable_csp_header actually gated Permissions-Policy, so copying it would
@@ -895,25 +1045,68 @@ function hsts_plugin_run_migrations(): void {
         hsts_plugin_migrate_options_to_v2();
         // Option migrations are done in the DB; safe to bump the version now.
         // The .htaccess cleanup is tracked separately (it may need retries)
-        // and must NOT gate the version bump, or option migrations would run
+        // and must not gate the version bump, or option migrations would run
         // forever on sites where the filesystem is unavailable.
-        update_option( 'hsts_plugin_db_version', HSTS_PLUGIN_DB_VERSION );
+        update_option( 'hsts_plugin_db_version', 2 );
         update_option( 'hsts_htaccess_cleanup_pending', 1 );
     }
 
     // Retry the .htaccess cleanup until it definitively succeeds, so a site
     // whose filesystem was unavailable at update time never keeps an orphan
-    // block. Cleared as soon as cleanup reports done.
+    // block. Cleared as soon as cleanup reports done. (v2 removed the block;
+    // v3 below re-writes a fresh one, so this runs first and is a no-op once
+    // the v3 write has landed.)
     if ( get_option( 'hsts_htaccess_cleanup_pending' ) ) {
         if ( hsts_plugin_cleanup_htaccess() ) {
             delete_option( 'hsts_htaccess_cleanup_pending' );
         }
     }
+
+    if ( $stored < 3 ) {
+        hsts_plugin_migrate_options_to_v3();
+        update_option( 'hsts_plugin_db_version', 3 );
+        // (Re)write the managed block now, and keep retrying on later loads if
+        // the filesystem is not available yet. The write is a no-op on nginx /
+        // IIS (server does not read .htaccess) and on any locked filesystem.
+        update_option( 'hsts_htaccess_write_pending', 1 );
+    }
+
+    if ( get_option( 'hsts_htaccess_write_pending' ) ) {
+        $result = hsts_plugin_write_htaccess();
+        // Stop retrying once we either wrote successfully, confirmed there is
+        // nothing to write (server unsupported / all headers disabled), or a
+        // roll-back fired. Keep the flag only for transient filesystem issues.
+        $done = array( 'written', 'written_unverified', 'unchanged', 'no_headers', 'unsupported_server' );
+        if ( $result['ok'] && in_array( $result['reason'], $done, true ) ) {
+            delete_option( 'hsts_htaccess_write_pending' );
+        } elseif ( ! $result['ok'] && 'verify_failed_rolled_back' === $result['reason'] ) {
+            delete_option( 'hsts_htaccess_write_pending' );
+        }
+    }
 }
 add_action( 'plugins_loaded', 'hsts_plugin_run_migrations' );
 
+/**
+ * Self-heal: on a real admin request (SERVER_SOFTWARE reliable), if we believe a
+ * block was written but this server does not read .htaccess, remove the stray
+ * block. Covers sites where an earlier build wrote it from a php-cli context.
+ * Cheap: gated on the autoloaded coverage record, so no work on healthy sites.
+ */
+function hsts_plugin_heal_stray_htaccess_block(): void {
+    $written = get_option( 'hsts_htaccess_written_headers' );
+    if ( empty( $written ) ) {
+        return;
+    }
+    if ( ! function_exists( 'hsts_plugin_server_supports_htaccess' )
+        || hsts_plugin_server_supports_htaccess() ) {
+        return;
+    }
+    hsts_plugin_write_htaccess(); // unsupported-server path strips the block + clears the record
+}
+add_action( 'admin_init', 'hsts_plugin_heal_stray_htaccess_block' );
+
 function hsts_plugin_migrate_options_to_v2(): void {
-    // Reset ALL legacy disable_* flags. We deliberately do NOT copy any value
+    // Reset all legacy disable_* flags. We deliberately do not copy any value
     // forward: the old flags only disabled the PHP side while .htaccess kept
     // emitting, so their meaning has changed. A user who ticked the (mis-named)
     // "CSP" box to de-duplicate would otherwise silently lose Permissions-Policy
@@ -940,6 +1133,38 @@ function hsts_plugin_migrate_options_to_v2(): void {
 }
 
 /**
+ * Migration to DB v3 (5.3.5): seed the per-site probe secret used by the
+ * loopback self-check. The .htaccess (re)write itself is driven separately via
+ * hsts_htaccess_write_pending so it can retry if the filesystem is not yet
+ * available. Any confirmation state from an interrupted run is cleared so the
+ * fresh writer starts from emit-everything.
+ */
+function hsts_plugin_migrate_options_to_v3(): void {
+    hsts_plugin_get_probe_token();          // generates + stores on first call
+    delete_option( 'hsts_htaccess_confirmed' ); // start from a clean, emit-all state
+
+    // Carry each legacy per-header disable flag forward to the new tri-state as
+    // 'off' - the exact meaning it had when the user ticked it. Never map a
+    // ticked box to 'server only'. Only seeds a mode that is not already set,
+    // so a value chosen on this version is never overwritten.
+    foreach ( hsts_plugin_managed_header_map() as $def ) {
+        $mode_key = hsts_plugin_header_mode_option( $def['option'] );
+        if ( '' === (string) get_option( $mode_key, '' ) && get_option( $def['option'] ) ) {
+            update_option( $mode_key, 'off' );
+        }
+    }
+
+    // Re-announce the delivery change with corrected wording. 5.3.5 restores
+    // .htaccess writing, so the old v2 banner (which said headers are no longer
+    // written to .htaccess) is now false. A new key means anyone who dismissed
+    // the v2 notice still sees this one. Runs only on the <3 -> 3 crossing, and
+    // fresh installs never reach here (activation seeds db_version current), so
+    // brand-new sites are not shown an upgrade notice.
+    delete_option( 'hsts_show_migration_notice_v2' ); // retire the stale banner
+    update_option( 'hsts_show_migration_notice_v3', 1 );
+}
+
+/**
  * Dismissible admin notice explaining the 5.3.4 semantic change to the
  * "Resolve duplicate headers" checkboxes. Shown once, on the plugin's own
  * settings page, until dismissed.
@@ -948,19 +1173,19 @@ function hsts_plugin_migration_notice(): void {
     if ( ! current_user_can( 'manage_options' ) ) {
         return;
     }
-    if ( ! get_option( 'hsts_show_migration_notice_v2' ) ) {
+    if ( ! get_option( 'hsts_show_migration_notice_v3' ) ) {
         return;
     }
 
     $dismiss_url = wp_nonce_url(
-        add_query_arg( 'hsts_dismiss_notice', 'v2' ),
-        'hsts_dismiss_notice_v2'
+        add_query_arg( 'hsts_dismiss_notice', 'v3' ),
+        'hsts_dismiss_notice_v3'
     );
     ?>
     <div class="notice notice-warning is-dismissible">
         <p>
             <strong><?php esc_html_e( 'Headers Security Advanced & HSTS WP', 'headers-security-advanced-hsts-wp' ); ?></strong> &mdash;
-            <?php esc_html_e( 'This update changes how security headers are delivered: they are now emitted a single time via PHP and are no longer written to .htaccess, so duplicate headers are eliminated. Because of this, the old "Resolve duplicate headers" checkboxes have been reset and now fully turn a header on or off. Please review your settings and re-check any header you intentionally want disabled.', 'headers-security-advanced-hsts-wp' ); ?>
+            <?php esc_html_e( 'This update restores server-level delivery: on Apache and LiteSpeed the security headers are again written to your .htaccess, so they also cover cached and static responses, while PHP stays the source on dynamic pages. The plugin takes care of any duplicate headers itself. A previous update also reset the old "Resolve duplicate headers" checkboxes, so please review your settings and re-check any header you intentionally want disabled.', 'headers-security-advanced-hsts-wp' ); ?>
             <a href="<?php echo esc_url( admin_url( 'options-general.php?page=headers-security-advanced-hsts-wp-plugin' ) ); ?>"><?php esc_html_e( 'Open settings', 'headers-security-advanced-hsts-wp' ); ?></a>
             &middot;
             <a href="<?php echo esc_url( $dismiss_url ); ?>"><?php esc_html_e( 'Dismiss', 'headers-security-advanced-hsts-wp' ); ?></a>
@@ -974,11 +1199,11 @@ function hsts_plugin_maybe_dismiss_notice(): void {
     if ( ! current_user_can( 'manage_options' ) ) {
         return;
     }
-    if ( ! isset( $_GET['hsts_dismiss_notice'] ) || 'v2' !== $_GET['hsts_dismiss_notice'] ) {
+    if ( ! isset( $_GET['hsts_dismiss_notice'] ) || 'v3' !== $_GET['hsts_dismiss_notice'] ) {
         return;
     }
-    check_admin_referer( 'hsts_dismiss_notice_v2' );
-    delete_option( 'hsts_show_migration_notice_v2' );
+    check_admin_referer( 'hsts_dismiss_notice_v3' );
+    delete_option( 'hsts_show_migration_notice_v3' );
 }
 add_action( 'admin_init', 'hsts_plugin_maybe_dismiss_notice' );
 
@@ -1067,6 +1292,17 @@ add_filter( 'plugin_action_links', 'hsts_plugin_add_plugin_action_links', 10, 2 
 function hsts_plugin_deactivate(): void {
     hsts_plugin_cleanup_htaccess();
     hsts_plugin_delete_old_options();
+
+    // Stop the background probe and drop transient suppression state so the
+    // plugin leaves nothing scheduled or half-decided behind it.
+    $probe_event = wp_next_scheduled( 'hsts_probe_event' );
+    if ( $probe_event ) {
+        wp_unschedule_event( $probe_event, 'hsts_probe_event' );
+    }
+    delete_option( 'hsts_htaccess_confirmed' );
+    delete_option( 'hsts_htaccess_write_pending' );
+    delete_option( 'hsts_htaccess_written_headers' );
+    delete_transient( 'hsts_probe_lock' );
 }
 register_deactivation_hook( __FILE__, 'hsts_plugin_deactivate' );
 
@@ -1077,7 +1313,7 @@ register_deactivation_hook(__FILE__, 'hsts_plugin_flush_rewrite_rules');
 // the version-gated hsts_plugin_run_migrations() on plugins_loaded instead.
 
 function hsts_plugin_get_filesystem(): ?WP_Filesystem_Base {
-    // WP_Filesystem() lives in wp-admin/includes/file.php, which is NOT loaded
+    // WP_Filesystem() lives in wp-admin/includes/file.php, which is not loaded
     // on front-end requests. Migrations run on plugins_loaded for every
     // request, so we must load it ourselves or the first post-update front-end
     // hit fatals on an undefined function.
